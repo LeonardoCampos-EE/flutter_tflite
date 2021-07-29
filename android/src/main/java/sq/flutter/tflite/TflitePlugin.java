@@ -3,6 +3,7 @@ package sq.flutter.tflite;
 import android.content.Context;
 import android.content.res.AssetFileDescriptor;
 import android.content.res.AssetManager;
+import android.graphics.RectF;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.ColorMatrix;
@@ -28,7 +29,6 @@ import io.flutter.plugin.common.PluginRegistry.Registrar;
 import org.tensorflow.lite.DataType;
 import org.tensorflow.lite.Interpreter;
 import org.tensorflow.lite.Tensor;
-
 import org.tensorflow.lite.gpu.GpuDelegate;
 
 import java.io.BufferedReader;
@@ -51,6 +51,7 @@ import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Vector;
 
+import sq.flutter.yolov5.Recognition;
 
 public class TflitePlugin implements MethodCallHandler {
   private final Registrar mRegistrar;
@@ -589,6 +590,8 @@ public class TflitePlugin implements MethodCallHandler {
 
     if (model.equals("SSDMobileNet")) {
       new RunSSDMobileNet(args, imgData, NUM_RESULTS_PER_CLASS, THRESHOLD, result).executeTfliteTask();
+    } else if (model.equals("YoloV5")) {
+      new RunYoloV5(args, imgData, THRESHOLD, result).executeTfliteTask();
     } else {
       new RunYOLO(args, imgData, BLOCK_SIZE, NUM_BOXES_PER_BLOCK, ANCHORS, THRESHOLD, NUM_RESULTS_PER_CLASS, result).executeTfliteTask();
     }
@@ -608,6 +611,8 @@ public class TflitePlugin implements MethodCallHandler {
 
     if (model.equals("SSDMobileNet")) {
       new RunSSDMobileNet(args, imgData, NUM_RESULTS_PER_CLASS, THRESHOLD, result).executeTfliteTask();
+    } else if (model.equals("YoloV5")) {
+      new RunYoloV5(args, imgData, THRESHOLD, result).executeTfliteTask();
     } else {
       new RunYOLO(args, imgData, BLOCK_SIZE, NUM_BOXES_PER_BLOCK, ANCHORS, THRESHOLD, NUM_RESULTS_PER_CLASS, result).executeTfliteTask();
     }
@@ -635,6 +640,8 @@ public class TflitePlugin implements MethodCallHandler {
 
     if (model.equals("SSDMobileNet")) {
       new RunSSDMobileNet(args, imgData, NUM_RESULTS_PER_CLASS, THRESHOLD, result).executeTfliteTask();
+    } else if (model.equals("YoloV5")) {
+      new RunYoloV5(args, imgData, THRESHOLD, result).executeTfliteTask();
     } else {
       new RunYOLO(args, imgData, BLOCK_SIZE, NUM_BOXES_PER_BLOCK, ANCHORS, THRESHOLD, NUM_RESULTS_PER_CLASS, result).executeTfliteTask();
     }
@@ -843,6 +850,215 @@ public class TflitePlugin implements MethodCallHandler {
       }
       result.success(results);
     }
+  }
+
+  private class RunYoloV5 extends TfliteTask {
+    ByteBuffer imgData;
+    float threshold;
+    long startTime;
+    int numClasses;
+    int outputBox;
+    Map<Integer, Object> outputMap = new HashMap<>();
+    ByteBuffer outData;
+
+    RunYoloV5(HashMap args,
+            ByteBuffer imgData,
+            float threshold,
+            Result result) {
+      super(args, result);
+      this.imgData = imgData;
+      this.threshold = threshold;
+      this.startTime = SystemClock.uptimeMillis();
+
+      Tensor tensor = tfLite.getInputTensor(0);
+      inputSize = tensor.shape()[1];
+
+      this.numClasses = labels.size();
+
+      this.outputBox = (int) ((Math.pow((inputSize / 32), 2) + Math.pow((inputSize / 16), 2) + Math.pow((inputSize / 8), 2)) * 3);
+    
+      outData = ByteBuffer.allocateDirect(outputBox * (numClasses + 5) * 4);
+      outData.order(ByteOrder.nativeOrder());
+      outData.rewind();
+      outputMap.put(0, outData);
+    }
+
+    protected void runTflite() {
+      try{        
+        Object[] inputArray = {imgData};
+        tfLite.runForMultipleInputsOutputs(inputArray, outputMap);
+      } catch (Exception e) {
+        result.error(" -------------- Failed on inference ", e.getMessage(), e);
+      }
+    }
+
+    protected void onRunTfliteDone() {
+      Log.v("time", "Inference took " + (SystemClock.uptimeMillis() - startTime));
+
+      ByteBuffer byteBuffer = (ByteBuffer) outputMap.get(0);
+      byteBuffer.rewind();
+
+      // All correct
+      Log.v("Inference", "NumClasses: " + numClasses);
+      Log.v("Inference", "NumBoxes: " + outputBox);
+      Log.v("Inference", "inputSize: " + inputSize);
+
+      float[][][] out = new float[1][outputBox][numClasses + 5]; // [1, numBoxes, x y w h conf class1Prob class2Prob]
+      // Save inference results on float array
+      for (int i = 0; i < outputBox; ++i) {
+        for (int j = 0; j < numClasses + 5; ++j) {
+          // All ok here
+          out[0][i][j] = byteBuffer.getFloat();
+        }
+      }
+
+      ArrayList<Recognition> detections = new ArrayList<Recognition>();
+
+      // Iterate throgh the bboxes
+      for (int i = 0; i < outputBox; ++i) {
+        final int offset = 0;
+        final float confidence = out[0][i][4];
+        int detectedClass = -1;
+        float maxClass = 0;
+
+        // Get the probability of each class
+        final float[] classes = new float[numClasses];
+        for (int c = 0; c < numClasses; ++c) {
+          classes[c] = out[0][i][5 + c];
+        }
+
+        // Get which is the detected class (bigger probability)
+        for (int c = 0; c < numClasses; ++c) {
+          if (classes[c] > maxClass) {
+            detectedClass = c;
+            maxClass = classes[c];
+          }
+        }
+
+        // Full conficence = bbox confidence * class confidence
+        final float confidenceInClass = maxClass * confidence;
+
+        // Check if the full confidence is bigget than the threshold
+        if (confidenceInClass > threshold) {
+
+          // Get this box coordinates
+          final float xPos = out[0][i][0];
+          final float yPos = out[0][i][1];
+          final float w = out[0][i][2];
+          final float h = out[0][i][3];
+
+          Log.v("YoloV5", Float.toString(xPos) + ',' + Float.toString(yPos) + ',' + Float.toString(w) + ',' + Float.toString(h));
+
+          final RectF rect = new RectF(
+            Math.max(0, xPos - (w / 2)),
+            Math.max(0, yPos - (h / 2)),
+            Math.min(1, xPos + (w / 2)),
+            Math.min(1, yPos + (h / 2))
+          );
+
+          detections.add(new Recognition("" + offset, labels.get(detectedClass),
+                  confidenceInClass, rect, detectedClass));
+        }
+      }
+
+      final ArrayList<Recognition> recognitions = nms(detections);
+      Log.v("Inference", "Recognitions len -> " + recognitions.size());
+
+      List<Map<String, Object>> results = new ArrayList<>();
+      for (int i = 0; i < recognitions.size(); i++){
+        // Log.v("Recognitions: ", recognitions.get(i).toString());
+        Map<String, Object> det = new HashMap<>();
+
+        det.put("class", recognitions.get(i).getTitle());
+
+        RectF ret = recognitions.get(i).getLocation();
+        det.put("cx", ret.centerX());
+        det.put("cy", ret.centerY());
+        det.put("w", ret.width());
+        det.put("h", ret.height());
+
+        results.add(det);
+      }
+      result.success(results);
+    }
+
+    //non maximum suppression
+    protected ArrayList<Recognition> nms(ArrayList<Recognition> list) {
+        ArrayList<Recognition> nmsList = new ArrayList<Recognition>();
+
+        for (int k = 0; k < numClasses; k++) {
+            //1.find max confidence per class
+            PriorityQueue<Recognition> pq =
+                    new PriorityQueue<Recognition>(
+                            50,
+                            new Comparator<Recognition>() {
+                                @Override
+                                public int compare(final Recognition lhs, final Recognition rhs) {
+                                    // Intentionally reversed to put high confidence at the head of the queue.
+                                    return Float.compare(rhs.getConfidence(), lhs.getConfidence());
+                                }
+                            });
+
+            for (int i = 0; i < list.size(); ++i) {
+                if (list.get(i).getDetectedClass() == k) {
+                    pq.add(list.get(i));
+                }
+            }
+
+            //2.do non maximum suppression
+            while (pq.size() > 0) {
+                //insert detection with max confidence
+                Recognition[] a = new Recognition[pq.size()];
+                Recognition[] detections = pq.toArray(a);
+                Recognition max = detections[0];
+                nmsList.add(max);
+                pq.clear();
+
+                for (int j = 1; j < detections.length; j++) {
+                    Recognition detection = detections[j];
+                    RectF b = detection.getLocation();
+                    if (box_iou(max.getLocation(), b) < mNmsThresh) {
+                        pq.add(detection);
+                    }
+                }
+            }
+        }
+        return nmsList;
+    }
+
+    protected float mNmsThresh = 0.45f;
+
+    protected float box_iou(RectF a, RectF b) {
+        return box_intersection(a, b) / box_union(a, b);
+    }
+
+    protected float box_intersection(RectF a, RectF b) {
+        float w = overlap((a.left + a.right) / 2, a.right - a.left,
+                (b.left + b.right) / 2, b.right - b.left);
+        float h = overlap((a.top + a.bottom) / 2, a.bottom - a.top,
+                (b.top + b.bottom) / 2, b.bottom - b.top);
+        if (w < 0 || h < 0) return 0;
+        float area = w * h;
+        return area;
+    }
+
+    protected float box_union(RectF a, RectF b) {
+        float i = box_intersection(a, b);
+        float u = (a.right - a.left) * (a.bottom - a.top) + (b.right - b.left) * (b.bottom - b.top) - i;
+        return u;
+    }
+
+    protected float overlap(float x1, float w1, float x2, float w2) {
+        float l1 = x1 - w1 / 2;
+        float l2 = x2 - w2 / 2;
+        float left = l1 > l2 ? l1 : l2;
+        float r1 = x1 + w1 / 2;
+        float r2 = x2 + w2 / 2;
+        float right = r1 < r2 ? r1 : r2;
+        return right - left;
+    }
+
+
   }
 
   private class RunPix2PixOnImage extends TfliteTask {

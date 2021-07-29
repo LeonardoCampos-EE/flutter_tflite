@@ -132,7 +132,7 @@ class Tflite {
   static Future<List?> detectObjectOnBinary({
     required Uint8List binary,
     String model = "SSDMobileNet",
-    double threshold = 0.1,
+    double threshold = 0.25,
     int numResultsPerClass = 5,
     // Used in YOLO only
     List anchors = anchors,
@@ -140,6 +140,7 @@ class Tflite {
     int numBoxesPerBlock = 5,
     bool asynch = true,
   }) async {
+
     return await _channel.invokeMethod(
       'detectObjectOnBinary',
       {
@@ -164,7 +165,7 @@ class Tflite {
     double imageStd = 127.5,
     double threshold = 0.1,
     int numResultsPerClass = 5,
-    int rotation: 90, // Android only
+    int rotation = 90, // Android only
     // Used in YOLO only
     List anchors = anchors,
     int blockSize = 32,
